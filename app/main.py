@@ -13,8 +13,10 @@ from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db, inference, svf
 from .bsdl import BsdlError, parse_bsdl
+from .consistency import analyze_consistency
 from .models import (
     BsdlUpload,
+    ConsistencyRequest,
     DeviceModelIn,
     InferRequest,
     device_from_in,
@@ -183,3 +185,46 @@ def export_svf(version_id: int, candidate: int = 0) -> Response:
         headers={"Content-Disposition":
                  f'attachment; filename="chain_v{version_id}_c{candidate}.svf"'},
     )
+
+
+# ---------------------------------------------------------------- repeat-sample consistency
+
+@app.post("/consistency", status_code=201)
+def run_consistency(req: ConsistencyRequest) -> dict:
+    """Check labeled repeat IR/DR samples against a saved chain version.
+
+    Samples are grouped by (kind, instruction), aligned per run on their TDI
+    echo and mapped through the saved chain; per-bit stability, toggles and
+    missing intervals are reported. Misaligned runs (TDO constant, register
+    length mismatch, echo not found) are flagged with positions and excluded
+    from the statistics. The batch is persisted; raw captures and existing
+    versions are never modified.
+    """
+    version = db.get_version(req.version_id)
+    if not version:
+        raise HTTPException(404, f"version id {req.version_id} not found")
+    if version["session"] != req.session:
+        raise HTTPException(
+            422, f"version {req.version_id} belongs to session "
+                 f"{version['session']!r}, request session is {req.session!r}")
+    runs = [r.model_dump() for r in req.runs]
+    try:
+        result = analyze_consistency(runs, version, req.candidate)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    batch_id = db.add_consistency_batch(
+        req.session, req.version_id, req.candidate, runs, result, req.note)
+    return {"batch_id": batch_id, **result}
+
+
+@app.get("/consistency")
+def list_consistency_batches(session: str | None = Query(None)) -> list[dict]:
+    return db.list_consistency_batches(session)
+
+
+@app.get("/consistency/{batch_id}")
+def get_consistency_batch(batch_id: int) -> dict:
+    row = db.get_consistency_batch(batch_id)
+    if not row:
+        raise HTTPException(404, "consistency batch not found")
+    return row

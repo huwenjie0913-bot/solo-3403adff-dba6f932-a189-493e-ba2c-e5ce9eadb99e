@@ -31,6 +31,28 @@ CREATE TABLE IF NOT EXISTS versions (
     note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS consistency_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL,
+    version_id INTEGER NOT NULL,
+    candidate INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS consistency_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    run_index INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    instruction TEXT,
+    tdi TEXT NOT NULL,
+    tdo TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consistency_runs_batch
+    ON consistency_runs(batch_id);
 """
 
 
@@ -131,5 +153,67 @@ def list_versions(session: str | None = None) -> list[dict]:
         else:
             rows = c.execute(
                 "SELECT id, session, note, created_at FROM versions ORDER BY id"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------------------------------- consistency batches
+
+def add_consistency_batch(session: str, version_id: int, candidate: int,
+                          runs: list[dict], result: dict, note: str) -> int:
+    """Insert batch + its labeled runs in one transaction. Never touches the
+    captures or versions tables."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO consistency_batches"
+            "(session, version_id, candidate, note, result_json, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (session, version_id, candidate, note, json.dumps(result), _now()),
+        )
+        batch_id = cur.lastrowid
+        c.executemany(
+            "INSERT INTO consistency_runs"
+            "(batch_id, run_index, label, kind, instruction, tdi, tdo, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            [
+                (batch_id, i, r["label"], r["kind"], r.get("instruction"),
+                 r["tdi"], r["tdo"], _now())
+                for i, r in enumerate(runs)
+            ],
+        )
+        return batch_id
+
+
+def get_consistency_batch(batch_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM consistency_batches WHERE id=?", (batch_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["result"] = json.loads(d.pop("result_json"))
+        d["runs"] = [
+            dict(r) for r in c.execute(
+                "SELECT run_index, label, kind, instruction, tdi, tdo"
+                " FROM consistency_runs WHERE batch_id=? ORDER BY run_index",
+                (batch_id,),
+            ).fetchall()
+        ]
+    return d
+
+
+def list_consistency_batches(session: str | None = None) -> list[dict]:
+    with _conn() as c:
+        if session:
+            rows = c.execute(
+                "SELECT id, session, version_id, candidate, note, created_at"
+                " FROM consistency_batches WHERE session=? ORDER BY id",
+                (session,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id, session, version_id, candidate, note, created_at"
+                " FROM consistency_batches ORDER BY id"
             ).fetchall()
     return [dict(r) for r in rows]

@@ -21,6 +21,17 @@ JTAG 扫描链。本机运行的 REST API：FastAPI + Pydantic + SQLite。
 - 生成**只使用 IDCODE、BYPASS、SAMPLE/PRELOAD** 的 SVF 复核序列——
   绝不加载 EXTEST/INTEST/CLAMP，不会驱动器件输出引脚。
 - 原始采样与推断版本存入 SQLite，可导出 JSON 链定义与 SVF 文件。
+- **重复采样一致性与间歇故障定位**：对同一会话内带标签的多次 IR/DR
+  TDI/TDO 采样，按 `(类型, 指令)` 分组、按 TDI 回显逐次对齐，用已保存的
+  链版本把 TDO 位映射到链位置 / 器件 / 寄存器位，统计每一位的稳定值、
+  翻转次数和缺失区间，并区分：
+  - `segment_fixed_offset` 整段固定偏移（本次捕获内容整体平移若干位）；
+  - `intermittent_device_toggle` 单器件间歇翻转（同一位在多次运行上反复异常）；
+  - `tdo_constant` TDO 整段恒定（断链 / TDO 短接 / TAP 停在复位）；
+  - `isolated_sample_anomaly` 孤立采样异常（单次探针毛刺 / 读错一位）；
+  - 以及 `register_length_mismatch` / `alignment_failed`（长度不符或回显
+    找不到的运行，给出具体运行与 TDO 位并排除在统计外）。
+  批次与诊断写入 SQLite，支持 JSON 查询；不改动原始采样与既有推断版本。
 
 ## 运行
 
@@ -50,6 +61,9 @@ python3 -m pytest tests/                # 测试
 | GET  | `/versions` / `/versions/{id}` | 查询推断版本 |
 | GET  | `/versions/{id}/export?candidate=0` | 导出 JSON 链定义 |
 | GET  | `/versions/{id}/svf?candidate=0` | 下载 SVF 复核序列 |
+| POST | `/consistency` | 对带标签的多次采样做一致性分析与间歇故障定位，返回分组结果 + `batch_id` |
+| GET  | `/consistency` | 列出一致性批次（可按 session 过滤） |
+| GET  | `/consistency/{id}` | 查询某批次的运行、分组、逐位统计与诊断 |
 
 ## 推断流程
 
@@ -80,15 +94,63 @@ python3 -m pytest tests/                # 测试
 
 锁定与不可靠段修改后再次 POST `/infer` 即可重算，每次都会保存为新版本。
 
+## 重复采样一致性 / 间歇故障定位
+
+POST `/consistency`，引用一个**已保存**的链版本（`version_id` + `candidate`），
+提交同一会话内带唯一标签的多次采样：
+
+```json
+{
+  "session": "board-42",
+  "version_id": 3,
+  "candidate": 0,
+  "note": "复测三冷启动 + 两热机",
+  "runs": [
+    {"label": "cold-1", "kind": "ir", "tdi": "101100...", "tdo": "1000001000..."},
+    {"label": "cold-2", "kind": "ir", "tdi": "101100...", "tdo": "1000001000..."},
+    {"label": "hot-1",  "kind": "ir", "tdi": "101100...", "tdo": "1000011000..."}
+  ]
+}
+```
+
+处理流程：
+
+1. **分组**：按 `(kind, instruction)`（指令大小写/空格归一）分组，IR 以 `instruction=null`。
+2. **逐次对齐**：在 TDO 中定位 TDI 回显得到该次寄存器长度；与版本长度一致
+   才映射，回显提早 1–4 位视为捕获头截断（记为缺失区间），其余偏移判为
+   `register_length_mismatch`，完全找不到回显判 `alignment_failed`，整段不变判
+   `tdo_constant`——这些运行给出具体运行与 TDO 位并**排除在逐位统计之外**。
+3. **逐位映射统计**：`mapped` 模式按版本把 TDO 位映射到链位置 / 器件 /
+   寄存器本地位（位 0 = 最靠近 TDO）；无法从版本推导 DR 布局的自定义指令用
+   `wire` 模式按原始 TDO 索引统计。每位返回 `stable`、`count_0/1`、`toggles`、
+   `observed_runs/missing_runs`、与版本 IR 捕获值对照的 `expected`。
+4. **故障分类**（每条诊断给 `first_anomaly`、`affected_positions/devices` 与
+   支撑结论的原始 `chain_bit` / 寄存器位 / 各运行 `tdo_index`）：
+   - `segment_fixed_offset`：某次捕获内容与其它运行整体平移 ±1/±2 位可解释
+     ≥90% 的差异——整段固定偏移（时钟 / 探针相位），该次这些位不再计入器件故障；
+   - `intermittent_device_toggle`：同一寄存器位在**多个不同运行**上翻转而其余
+     运行稳定——单器件间歇故障；
+   - `isolated_sample_anomaly`：仅单个运行、单个位异常，或同一次采样跨多个
+     器件的散点异常——该次采样本身的毛刺，而非器件问题；
+   - `tdo_constant`：该次 TDO 全程恒定。
+5. **缺失区间**：`missing_intervals` 给出在某（几）次已对齐运行中未观测到的
+   连续链位范围及涉及运行。
+6. **持久化**：批次（含运行原始位流）与完整结果写入
+   `consistency_batches` / `consistency_runs`；`captures` 与 `versions`
+   表保持不变。
+
 ## 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由与导出
-  models.py     Pydantic 请求模型（BSDL 位序 -> 移出顺序转换）
-  bsdl.py       BSDL 子集解析器
-  inference.py  对齐、IR 分段、DR 验证、评分与五项诊断检查
-  svf.py        安全 SVF 生成（仅 IDCODE/BYPASS/SAMPLE/PRELOAD）
-  db.py         SQLite 存储（devices / captures / versions）
-tests/test_api.py  含理想链模拟器的端到端测试
+  main.py        FastAPI 路由与导出
+  models.py      Pydantic 请求模型（BSDL 位序 -> 移出顺序转换）
+  bsdl.py        BSDL 子集解析器
+  inference.py   对齐、IR 分段、DR 验证、评分与五项诊断检查
+  consistency.py 重复采样分组、TDI 回显对齐、链版本映射、逐位统计与故障分类
+  svf.py         安全 SVF 生成（仅 IDCODE/BYPASS/SAMPLE/PRELOAD）
+  db.py          SQLite 存储（devices / captures / versions /
+                 consistency_batches / consistency_runs）
+tests/test_api.py          含理想链模拟器的端到端测试
+tests/test_consistency.py  重复采样一致性与故障定位的端到端测试
 ```

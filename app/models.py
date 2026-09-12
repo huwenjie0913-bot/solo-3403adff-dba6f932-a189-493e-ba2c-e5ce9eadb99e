@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .inference import Device
 
@@ -95,3 +95,42 @@ def device_from_in(m: DeviceModelIn) -> Device:
         idcode_mask=mask,
         boundary_length=m.boundary_length,
     )
+
+
+class ConsistencyRunIn(BaseModel):
+    """One labeled repeat sample within a consistency batch."""
+
+    label: str = Field(min_length=1, max_length=128)
+    kind: Literal["ir", "dr"]
+    instruction: str | None = None
+    tdi: str
+    tdo: str
+
+    @field_validator("tdi", "tdo")
+    @classmethod
+    def _nonempty_bits(cls, v: str) -> str:
+        if not v:
+            raise ValueError("bit streams must not be empty")
+        if not re.fullmatch(r"[01]*", v):
+            raise ValueError("bit streams must contain only 0/1")
+        return v
+
+
+class ConsistencyRequest(BaseModel):
+    """A batch of labeled repeat samples to check against a saved chain
+    version. Raw captures and the inferred version are never modified."""
+
+    session: str = "default"
+    version_id: int = Field(ge=1)
+    candidate: int = Field(default=0, ge=0)
+    runs: list[ConsistencyRunIn] = Field(min_length=1)
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _unique_labels(self):
+        labels = [r.label for r in self.runs]
+        if len(set(labels)) != len(labels):
+            dup = sorted({x for x in labels if labels.count(x) > 1})
+            raise ValueError(f"run labels must be unique within a batch; "
+                             f"duplicated: {dup}")
+        return self
