@@ -11,13 +11,14 @@ import json
 
 from fastapi import FastAPI, HTTPException, Query, Response
 
-from . import db, inference, svf
+from . import db, diff as diff_mod, inference, svf
 from .bsdl import BsdlError, parse_bsdl
 from .consistency import analyze_consistency
 from .models import (
     BsdlUpload,
     ConsistencyRequest,
     DeviceModelIn,
+    DiffRequest,
     InferRequest,
     device_from_in,
 )
@@ -227,4 +228,130 @@ def get_consistency_batch(batch_id: int) -> dict:
     row = db.get_consistency_batch(batch_id)
     if not row:
         raise HTTPException(404, "consistency batch not found")
+    return row
+
+
+# --------------------------------------------------- version diff / migration
+
+def _version_or_404(version_id: int) -> dict:
+    version = db.get_version(version_id)
+    if not version:
+        raise HTTPException(404, f"version id {version_id} not found")
+    return version
+
+
+def _collect_diff_samples(req: DiffRequest, source_captures: list[dict]) -> tuple[list[dict], dict]:
+    """Gather the source version's historical samples to migrate.
+
+    Sources are read-only: captures embedded in the source inference
+    request, saved consistency batches of that version and raw session
+    captures selected by id.
+    """
+    samples: list[dict] = []
+    selection = {"version_captures": [], "consistency_batches": [],
+                 "capture_ids": []}
+
+    if req.include_version_captures:
+        for i, cap in enumerate(source_captures):
+            samples.append({
+                "kind": cap["kind"], "instruction": cap.get("instruction"),
+                "tdi": cap["tdi"], "tdo": cap["tdo"],
+                "origin": {"source": "version_request",
+                           "capture_index": i},
+            })
+            selection["version_captures"].append(i)
+
+    for bid in req.consistency_batch_ids:
+        batch = db.get_consistency_batch(bid)
+        if not batch:
+            raise HTTPException(404, f"consistency batch id {bid} not found")
+        if batch["session"] != req.session:
+            raise HTTPException(422, f"consistency batch {bid} belongs to "
+                                    f"session {batch['session']!r}")
+        if batch["version_id"] != req.source_version_id:
+            raise HTTPException(
+                422, f"consistency batch {bid} is based on version "
+                     f"{batch['version_id']}, source is "
+                     f"{req.source_version_id}")
+        for r in batch["runs"]:
+            samples.append({
+                "kind": r["kind"], "instruction": r.get("instruction"),
+                "tdi": r["tdi"], "tdo": r["tdo"],
+                "origin": {"source": "consistency_batch",
+                           "consistency_batch_id": bid,
+                           "label": r["label"], "run_index": r["run_index"]},
+            })
+        selection["consistency_batches"].append(bid)
+
+    for cid in req.capture_ids:
+        cap = db.get_capture(cid)
+        if not cap:
+            raise HTTPException(404, f"capture id {cid} not found")
+        if cap["session"] != req.session:
+            raise HTTPException(422, f"capture {cid} belongs to session "
+                                    f"{cap['session']!r}")
+        samples.append({
+            "kind": cap["kind"], "instruction": cap["instruction"],
+            "tdi": cap["tdi"], "tdo": cap["tdo"],
+            "origin": {"source": "capture", "capture_id": cid},
+        })
+        selection["capture_ids"].append(cid)
+    return samples, selection
+
+
+@app.post("/diff", status_code=201)
+def run_diff(req: DiffRequest) -> dict:
+    """Compare two saved inference versions of one session and migrate the
+    source version's historical samples onto the target.
+
+    Devices are aligned by name, IDCODE, IR length, boundary length and
+    unknown-slot signatures; ambiguous alignments are retained with their
+    matching basis. The report lists insertions/deletions/reorderings,
+    register-length changes and IR/DR bit-index maps; each migrated sample
+    is judged interpretable / interpretable with gaps / contradicting /
+    not interpretable with the affected register bits, missing data and
+    non-migration reasons. Raw captures and both versions stay read-only;
+    the JSON report is saved as an independent diff batch.
+    """
+    source = _version_or_404(req.source_version_id)
+    target = _version_or_404(req.target_version_id)
+    for which, v, cand in (
+        ("source", source, req.source_candidate),
+        ("target", target, req.target_candidate),
+    ):
+        if v["session"] != req.session:
+            raise HTTPException(
+                422, f"{which} version {v['id']} belongs to session "
+                     f"{v['session']!r}, request session is {req.session!r}")
+        if cand >= len(v["result"].get("candidates", [])):
+            raise HTTPException(
+                404, f"{which} candidate {cand} not found in version {v['id']}")
+
+    samples, selection = _collect_diff_samples(
+        req, source["request"].get("captures", []))
+
+    try:
+        result = diff_mod.compare_versions(
+            source, target, samples,
+            source_candidate=req.source_candidate,
+            target_candidate=req.target_candidate)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    result["sample_migration"]["selection"] = selection
+    batch_id = db.add_diff_batch(
+        req.session, req.source_version_id, req.source_candidate,
+        req.target_version_id, req.target_candidate, result, req.note)
+    return {"batch_id": batch_id, **result}
+
+
+@app.get("/diff")
+def list_diff_batches(session: str | None = Query(None)) -> list[dict]:
+    return db.list_diff_batches(session)
+
+
+@app.get("/diff/{batch_id}")
+def get_diff_batch(batch_id: int) -> dict:
+    row = db.get_diff_batch(batch_id)
+    if not row:
+        raise HTTPException(404, "diff batch not found")
     return row

@@ -134,3 +134,31 @@ class ConsistencyRequest(BaseModel):
             raise ValueError(f"run labels must be unique within a batch; "
                              f"duplicated: {dup}")
         return self
+
+
+class DiffRequest(BaseModel):
+    """Compare two saved inference versions of one session and migrate the
+    source version's historical samples onto the target version.
+
+    Historical samples come from any mix of: the captures embedded in the
+    source version's inference request, previously saved consistency batches
+    (of the source version) and raw captures stored in the session. Both
+    versions and all raw samples are only read."""
+
+    session: str = "default"
+    source_version_id: int = Field(ge=1)
+    source_candidate: int = Field(default=0, ge=0)
+    target_version_id: int = Field(ge=1)
+    target_candidate: int = Field(default=0, ge=0)
+    include_version_captures: bool = True
+    consistency_batch_ids: list[int] = []
+    capture_ids: list[int] = []
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _distinct_versions(self):
+        if self.source_version_id == self.target_version_id:
+            # same row is only legal when comparing different candidates
+            if self.source_candidate == self.target_candidate:
+                raise ValueError("source and target version/candidate must differ")
+        return self

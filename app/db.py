@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS consistency_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_consistency_runs_batch
     ON consistency_runs(batch_id);
+CREATE TABLE IF NOT EXISTS diff_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL,
+    source_version_id INTEGER NOT NULL,
+    source_candidate INTEGER NOT NULL DEFAULT 0,
+    target_version_id INTEGER NOT NULL,
+    target_candidate INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -120,6 +131,12 @@ def list_captures(session: str | None = None) -> list[dict]:
         else:
             rows = c.execute("SELECT * FROM captures ORDER BY id").fetchall()
     return [dict(r) for r in rows]
+
+
+def get_capture(capture_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM captures WHERE id=?", (capture_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def add_version(session: str, request: dict, result: dict, note: str) -> int:
@@ -215,5 +232,54 @@ def list_consistency_batches(session: str | None = None) -> list[dict]:
             rows = c.execute(
                 "SELECT id, session, version_id, candidate, note, created_at"
                 " FROM consistency_batches ORDER BY id"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------------------------------------- version diffs
+
+def add_diff_batch(session: str, source_version_id: int, source_candidate: int,
+                   target_version_id: int, target_candidate: int,
+                   result: dict, note: str) -> int:
+    """Persist an independent version-diff batch. Never touches the captures
+    or versions tables."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO diff_batches"
+            "(session, source_version_id, source_candidate, target_version_id,"
+            " target_candidate, note, result_json, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (session, source_version_id, source_candidate, target_version_id,
+             target_candidate, note, json.dumps(result), _now()),
+        )
+        return cur.lastrowid
+
+
+def get_diff_batch(batch_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM diff_batches WHERE id=?", (batch_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["result"] = json.loads(d.pop("result_json"))
+    return d
+
+
+def list_diff_batches(session: str | None = None) -> list[dict]:
+    with _conn() as c:
+        if session:
+            rows = c.execute(
+                "SELECT id, session, source_version_id, source_candidate,"
+                " target_version_id, target_candidate, note, created_at"
+                " FROM diff_batches WHERE session=? ORDER BY id",
+                (session,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id, session, source_version_id, source_candidate,"
+                " target_version_id, target_candidate, note, created_at"
+                " FROM diff_batches ORDER BY id"
             ).fetchall()
     return [dict(r) for r in rows]

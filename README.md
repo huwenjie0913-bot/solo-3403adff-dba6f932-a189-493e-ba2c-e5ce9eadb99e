@@ -31,7 +31,17 @@ JTAG 扫描链。本机运行的 REST API：FastAPI + Pydantic + SQLite。
   - `isolated_sample_anomaly` 孤立采样异常（单次探针毛刺 / 读错一位）；
   - 以及 `register_length_mismatch` / `alignment_failed`（长度不符或回显
     找不到的运行，给出具体运行与 TDO 位并排除在统计外）。
-  批次与诊断写入 SQLite，支持 JSON 查询；不改动原始采样与既有推断版本。
+- 批次与诊断写入 SQLite，支持 JSON 查询；不改动原始采样与既有推断版本。
+- **链版本差异与位映射迁移**：比较同一会话的两个已保存推断版本（含各自
+  候选），按器件名称、IDCODE、IR 长度、边界长度与未知槽捕获签名建立带
+  依据的对齐；无法唯一对齐时保留多个最优对齐并给出每条匹配依据。报告
+  器件插入 / 删除 / 重排、IR 与边界长度、IDCODE 变化，以及 IR / BYPASS /
+  IDCODE / SAMPLE 的逐位索引映射。选定源版本的历史采样（推断请求内嵌
+  采样、源版本的一致性批次、会话原始采样）后映射到目标版本，逐条判断
+  可否继续解释（`interpretable` / `interpretable_with_gaps` /
+  `contradicts_target` / `not_interpretable`），标出受影响寄存器位、
+  缺失位区间与不可迁移原因，生成可查询的 JSON 差异报告并保存为独立批次；
+  原始采样与两个版本只读。
 
 ## 运行
 
@@ -64,6 +74,9 @@ python3 -m pytest tests/                # 测试
 | POST | `/consistency` | 对带标签的多次采样做一致性分析与间歇故障定位，返回分组结果 + `batch_id` |
 | GET  | `/consistency` | 列出一致性批次（可按 session 过滤） |
 | GET  | `/consistency/{id}` | 查询某批次的运行、分组、逐位统计与诊断 |
+| POST | `/diff` | 比较两个已保存版本（含候选），生成结构差异 + 位映射 + 历史采样迁移报告，返回 `batch_id` |
+| GET  | `/diff` | 列出差异批次（可按 session 过滤） |
+| GET  | `/diff/{id}` | 查询某差异批次的完整 JSON 报告 |
 
 ## 推断流程
 
@@ -139,6 +152,56 @@ POST `/consistency`，引用一个**已保存**的链版本（`version_id` + `ca
    `consistency_batches` / `consistency_runs`；`captures` 与 `versions`
    表保持不变。
 
+## 版本差异与位映射迁移
+
+POST `/diff`，引用同一会话的两个已保存推断版本（`source_version_id` /
+`target_version_id`，可各自指定候选）：
+
+```json
+{
+  "session": "board-42",
+  "source_version_id": 3,
+  "source_candidate": 0,
+  "target_version_id": 5,
+  "target_candidate": 0,
+  "include_version_captures": true,
+  "consistency_batch_ids": [2],
+  "capture_ids": [14, 15],
+  "note": "加装第三片器件后复核"
+}
+```
+
+处理流程：
+
+1. **槽位对齐**：源/目标候选的每个器件作为二分图两侧，按名称（最强）、
+   IDCODE（重命名器件也可对齐）、IR 长度、BOUNDARY_LENGTH、未知槽捕获
+   签名与固定 IR 捕获模式相容性给出匹配边和依据（`basis`）；枚举最大权
+   匹配。存在多个等权最优解时全部保留（最多 6 个），对齐状态为
+   `ambiguous`，相关配对给出 `alternatives` 及其依据。
+2. **结构差异**：报告 `device_inserted` / `device_deleted` /
+   `devices_reordered`（仅相对次序变化，插入删除造成的整体平移不算重排）
+   / `ir_length_changed` / `boundary_length_changed` / `idcode_changed`。
+3. **位索引映射**：对 IR、DR:BYPASS、DR:IDCODE、DR:SAMPLE 分别按 TDO
+   线序建立段布局，逐位给出 `unchanged` / `remapped` / `relabeled` /
+   `dropped` / `added`、源/目标链位与器件内寄存器位、变化原因；超过
+   256 位时只列变化位。
+4. **历史采样迁移**：默认重放源版本推断请求内嵌的原始采样，也可选择源
+   版本的一致性批次（按 `version_id` 校验归属）和会话原始采样；每条采样
+   在目标长度附近同时校验 TDI 回显与目标期望内容（IR 捕获固定位、
+   BYPASS 必须为 0、IDCODE 掩码比对），判定：
+   - `interpretable`：内容与目标链一致；
+   - `interpretable_with_gaps`：捕获头/尾截断，部分目标位无数据
+     （`missing_bits` 给出区间）；
+   - `contradicts_target`：回显可对齐但内容矛盾，`mismatch_bits` 逐位
+     给出观测值/期望值与 TDO 索引；
+   - `not_interpretable`：`tdo_constant` / `alignment_failed` /
+     `register_length_mismatch` / `boundary_length_unknown` /
+     `target_register_layout_unknown`（自定义指令无法从版本推导 DR 布局）。
+   每条采样还列出受影响的重映射/新增/丢弃寄存器位、器件与链位置，并按
+   `(kind, instruction)` 及一致性批次汇总。
+5. **持久化**：报告（只读引用，不含复制之外的修改）写入 `diff_batches`；
+   `captures`、`versions`、`consistency_*` 表均不变。
+
 ## 项目结构
 
 ```
@@ -148,9 +211,11 @@ app/
   bsdl.py        BSDL 子集解析器
   inference.py   对齐、IR 分段、DR 验证、评分与五项诊断检查
   consistency.py 重复采样分组、TDI 回显对齐、链版本映射、逐位统计与故障分类
+  diff.py        版本槽位对齐、结构差异、IR/DR 位映射与历史采样迁移
   svf.py         安全 SVF 生成（仅 IDCODE/BYPASS/SAMPLE/PRELOAD）
   db.py          SQLite 存储（devices / captures / versions /
-                 consistency_batches / consistency_runs）
+                 consistency_batches / consistency_runs / diff_batches）
 tests/test_api.py          含理想链模拟器的端到端测试
 tests/test_consistency.py  重复采样一致性与故障定位的端到端测试
+tests/test_diff.py         版本差异与位映射迁移的端到端测试
 ```
