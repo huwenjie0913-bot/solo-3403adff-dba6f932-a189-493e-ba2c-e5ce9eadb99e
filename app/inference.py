@@ -22,6 +22,7 @@ class Device:
     idcode_value: int | None = None
     idcode_mask: int | None = None
     boundary_length: int | None = None
+    boundary_cells: list[dict] | None = None
     count: int = 1
 
 

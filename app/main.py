@@ -11,7 +11,7 @@ import json
 
 from fastapi import FastAPI, HTTPException, Query, Response
 
-from . import db, diff as diff_mod, inference, svf
+from . import db, diff as diff_mod, inference, interconnect, svf
 from .bsdl import BsdlError, parse_bsdl
 from .consistency import analyze_consistency
 from .models import (
@@ -20,6 +20,8 @@ from .models import (
     DeviceModelIn,
     DiffRequest,
     InferRequest,
+    InterconnectAnalysisRequest,
+    InterconnectPlanRequest,
     device_from_in,
 )
 
@@ -97,6 +99,7 @@ def infer(req: InferRequest) -> dict:
                 "idcode_value": hex(d.idcode_value) if d.idcode_value is not None else None,
                 "idcode_mask": hex(d.idcode_mask) if d.idcode_mask is not None else None,
                 "boundary_length": d.boundary_length,
+                "boundary_cells": d.boundary_cells,
             }
             for d in devices
         ],
@@ -354,4 +357,103 @@ def get_diff_batch(batch_id: int) -> dict:
     row = db.get_diff_batch(batch_id)
     if not row:
         raise HTTPException(404, "diff batch not found")
+    return row
+
+
+# ------------------------------------------- board boundary-scan interconnect
+
+def _bsdl_library() -> dict[str, list[dict]]:
+    """All uploaded BSDL models grouped by entity name, used as a fallback
+    when a saved version predates BOUNDARY_REGISTER parsing."""
+    library: dict[str, list[dict]] = {}
+    for row in db.list_devices():
+        model = row.get("model") or {}
+        library.setdefault(model.get("name", ""), []).append(model)
+    return library
+
+
+@app.post("/interconnect/plans", status_code=201)
+def create_interconnect_plan(req: InterconnectPlanRequest) -> dict:
+    """Plan a board-level EXTEST interconnect test from a saved chain version.
+
+    One driver is selected per board net, all other drivers are tri-stated
+    via their BSDL control cells, and conflict-free all-0/walking-1/all-1
+    boundary-register vectors are generated. Nets with unknown devices,
+    missing boundary models, no observer, drivers that cannot safely be
+    tri-stated or shared control cells are skipped with an explicit reason
+    and contribute no executable vectors. The plan (raw net request and
+    full result) is persisted; the saved version and BSDL rows are only read.
+    """
+    version = db.get_version(req.version_id)
+    if not version:
+        raise HTTPException(404, f"version id {req.version_id} not found")
+    if version["session"] != req.session:
+        raise HTTPException(
+            422, f"version {req.version_id} belongs to session "
+                 f"{version['session']!r}, request session is {req.session!r}")
+    if req.candidate >= len(version["result"].get("candidates", [])):
+        raise HTTPException(
+            404, f"candidate {req.candidate} not found in version {req.version_id}")
+
+    request = req.model_dump()
+    result = interconnect.plan_interconnect(
+        request["nets"], version, req.candidate, _bsdl_library())
+    plan_id = db.add_interconnect_plan(
+        req.session, req.version_id, req.candidate, request, result, req.note)
+    result["plan_id"] = plan_id
+    return {"plan_id": plan_id, **result}
+
+
+@app.get("/interconnect/plans")
+def list_interconnect_plans(session: str | None = Query(None)) -> list[dict]:
+    return db.list_interconnect_plans(session)
+
+
+@app.get("/interconnect/plans/{plan_id}")
+def get_interconnect_plan(plan_id: int) -> dict:
+    row = db.get_interconnect_plan(plan_id)
+    if not row:
+        raise HTTPException(404, "interconnect plan not found")
+    return row
+
+
+@app.post("/interconnect/analyses", status_code=201)
+def create_interconnect_analysis(req: InterconnectAnalysisRequest) -> dict:
+    """Analyze measured TDO of a saved interconnect plan.
+
+    TDO scans are unloaded through the saved chain onto the observer pins;
+    each net is reported as pass / suspected open / fixed level, with
+    synchronous bridge candidates, located to net, device pin and vector.
+    Raw measurements and the full result are persisted; the plan, saved
+    version and raw captures are never modified.
+    """
+    row = db.get_interconnect_plan(req.plan_id)
+    if not row:
+        raise HTTPException(404, f"interconnect plan id {req.plan_id} not found")
+    if row["session"] != req.session:
+        raise HTTPException(
+            422, f"plan {req.plan_id} belongs to session "
+                 f"{row['session']!r}, request session is {req.session!r}")
+    measurements = [m.model_dump() for m in req.measurements]
+    try:
+        result = interconnect.analyze_interconnect(row["result"], measurements)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    request = req.model_dump()
+    batch_id = db.add_interconnect_analysis(
+        req.session, req.plan_id, request, result, req.note)
+    return {"analysis_id": batch_id, **result}
+
+
+@app.get("/interconnect/analyses")
+def list_interconnect_analyses(session: str | None = Query(None),
+                               plan_id: int | None = Query(None)) -> list[dict]:
+    return db.list_interconnect_analyses(session, plan_id)
+
+
+@app.get("/interconnect/analyses/{analysis_id}")
+def get_interconnect_analysis(analysis_id: int) -> dict:
+    row = db.get_interconnect_analysis(analysis_id)
+    if not row:
+        raise HTTPException(404, "interconnect analysis not found")
     return row

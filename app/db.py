@@ -64,6 +64,29 @@ CREATE TABLE IF NOT EXISTS diff_batches (
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS interconnect_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL,
+    version_id INTEGER NOT NULL,
+    candidate INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS interconnect_analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL,
+    plan_id INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_interconnect_plans_version
+    ON interconnect_plans(version_id);
+CREATE INDEX IF NOT EXISTS idx_interconnect_analyses_plan
+    ON interconnect_analyses(plan_id);
 """
 
 
@@ -282,4 +305,97 @@ def list_diff_batches(session: str | None = None) -> list[dict]:
                 " target_version_id, target_candidate, note, created_at"
                 " FROM diff_batches ORDER BY id"
             ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------- board interconnect tests
+
+def add_interconnect_plan(session: str, version_id: int, candidate: int,
+                          request: dict, result: dict, note: str) -> int:
+    """Persist an interconnect plan (raw net request + full result). Never
+    modifies versions, captures or BSDL device rows."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO interconnect_plans"
+            "(session, version_id, candidate, note, request_json, "
+            " result_json, created_at) VALUES (?,?,?,?,?,?,?)",
+            (session, version_id, candidate, note,
+             json.dumps(request), json.dumps(result), _now()),
+        )
+        return cur.lastrowid
+
+
+def get_interconnect_plan(plan_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM interconnect_plans WHERE id=?", (plan_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["request"] = json.loads(d.pop("request_json"))
+        d["result"] = json.loads(d.pop("result_json"))
+    return d
+
+
+def list_interconnect_plans(session: str | None = None) -> list[dict]:
+    with _conn() as c:
+        if session:
+            rows = c.execute(
+                "SELECT id, session, version_id, candidate, note, created_at"
+                " FROM interconnect_plans WHERE session=? ORDER BY id",
+                (session,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id, session, version_id, candidate, note, created_at"
+                " FROM interconnect_plans ORDER BY id"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_interconnect_analysis(session: str, plan_id: int, request: dict,
+                              result: dict, note: str) -> int:
+    """Persist an interconnect analysis batch (raw measured TDO + full
+    result). The referenced plan is only read, never modified."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO interconnect_analyses"
+            "(session, plan_id, note, request_json, result_json, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (session, plan_id, note,
+             json.dumps(request), json.dumps(result), _now()),
+        )
+        return cur.lastrowid
+
+
+def get_interconnect_analysis(batch_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM interconnect_analyses WHERE id=?", (batch_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["request"] = json.loads(d.pop("request_json"))
+        d["result"] = json.loads(d.pop("result_json"))
+    return d
+
+
+def list_interconnect_analyses(session: str | None = None,
+                               plan_id: int | None = None) -> list[dict]:
+    sql = ("SELECT id, session, plan_id, note, created_at"
+           " FROM interconnect_analyses")
+    where, params = [], []
+    if session:
+        where.append("session=?")
+        params.append(session)
+    if plan_id is not None:
+        where.append("plan_id=?")
+        params.append(plan_id)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    with _conn() as c:
+        rows = c.execute(sql, params).fetchall()
     return [dict(r) for r in rows]

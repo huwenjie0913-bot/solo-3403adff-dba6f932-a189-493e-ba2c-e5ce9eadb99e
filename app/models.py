@@ -24,6 +24,9 @@ class DeviceModelIn(BaseModel):
     idcode_value: str | None = None  # hex, e.g. "0x03641093"
     idcode_mask: str | None = None
     boundary_length: int | None = None
+    # parsed BOUNDARY_REGISTER rows (see app.bsdl.parse_bsdl); optional for
+    # models supplied inline without BSDL
+    boundary_cells: list[dict] | None = None
 
     @field_validator("ir_capture")
     @classmethod
@@ -94,6 +97,7 @@ def device_from_in(m: DeviceModelIn) -> Device:
         idcode_value=value,
         idcode_mask=mask,
         boundary_length=m.boundary_length,
+        boundary_cells=m.boundary_cells,
     )
 
 
@@ -162,3 +166,71 @@ class DiffRequest(BaseModel):
             if self.source_candidate == self.target_candidate:
                 raise ValueError("source and target version/candidate must differ")
         return self
+
+
+# ----------------------------------------------- board interconnect (EXTEST)
+
+class NetEndpointIn(BaseModel):
+    """One pin of a board net, located on the saved candidate chain."""
+
+    device: str | None = None  # informational; position is authoritative
+    position: int = Field(ge=0)  # chain position, 0 = closest to TDI
+    port: str = Field(min_length=1, max_length=128)  # BSDL port identifier, e.g. "P(7)"
+
+
+class NetIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    endpoints: list[NetEndpointIn] = Field(min_length=1)
+
+
+class InterconnectPlanRequest(BaseModel):
+    """Board nets to test against a saved chain version. The version and all
+    BSDL models are only read; nets that cannot be driven safely are skipped
+    in the plan with an explicit reason and produce no vectors."""
+
+    session: str = "default"
+    version_id: int = Field(ge=1)
+    candidate: int = Field(default=0, ge=0)
+    nets: list[NetIn] = Field(min_length=1)
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _unique_nets_and_pins(self):
+        names = [n.name for n in self.nets]
+        dup_n = sorted({x for x in names if names.count(x) > 1})
+        if dup_n:
+            raise ValueError(f"net names must be unique; duplicated: {dup_n}")
+        pins = [(e.position, e.port.strip().upper()) for n in self.nets
+                for e in n.endpoints]
+        dup_p = sorted({x for x in pins if pins.count(x) > 1})
+        if dup_p:
+            raise ValueError(
+                f"each device pin may belong to one net; duplicated endpoints: "
+                f"{[{'position': p, 'port': port} for p, port in dup_p[:8]]}")
+        return self
+
+
+class TdoMeasurementIn(BaseModel):
+    """Measured TDO for one plan vector (wire order, bit 0 = first out)."""
+
+    vector_index: int = Field(ge=0)
+    tdo: str
+    label: str | None = None
+
+    @field_validator("tdo")
+    @classmethod
+    def _bits(cls, v: str) -> str:
+        if not v:
+            raise ValueError("tdo must not be empty")
+        if not re.fullmatch(r"[01]*", v):
+            raise ValueError("tdo must contain only 0/1")
+        return v
+
+
+class InterconnectAnalysisRequest(BaseModel):
+    """Measured TDO scans for every vector of a saved interconnect plan."""
+
+    session: str = "default"
+    plan_id: int = Field(ge=1)
+    measurements: list[TdoMeasurementIn] = Field(min_length=1)
+    note: str = ""
